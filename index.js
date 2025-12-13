@@ -15,7 +15,14 @@ const Message = require("./models/Message");
 const Otp = require("./models/Otp");
 const authMiddleware = require("./authMiddleware");
 
-const JWT_SECRET = process.env.JWT_SECRET;
+// ✅ Always trim once and use everywhere
+const JWT_SECRET = (process.env.JWT_SECRET || "").trim();
+
+if (!JWT_SECRET || JWT_SECRET.length < 20) {
+  console.error("❌ JWT_SECRET missing/too short. Fix Render env vars.");
+  process.exit(1);
+}
+
 const PHONE_REGEX = /^[0-9]{8,15}$/;
 
 // -------------------- DB --------------------
@@ -49,10 +56,6 @@ const io = new Server(server, {
     credentials: true,
   },
 });
-
-// -------------------- MEMORY STORES --------------------
-const messageStore = {};
-const onlineUsers = new Map();
 
 // -------------------- HEALTH --------------------
 app.get("/health", (req, res) => {
@@ -110,7 +113,7 @@ app.post("/login", async (req, res) => {
     if (!ok) return res.status(401).json({ message: "Invalid credentials" });
 
     const token = jwt.sign(
-      { userId: user._id, username: user.username },
+      { userId: user._id.toString(), username: user.username },
       JWT_SECRET,
       { expiresIn: "1d" }
     );
@@ -121,135 +124,176 @@ app.post("/login", async (req, res) => {
       username: user.username,
     });
   } catch (err) {
+    console.error(err);
     res.status(500).json({ message: "Internal server error" });
   }
 });
 
 // -------------------- OTP --------------------
 app.post("/auth/request-otp", async (req, res) => {
-  const { phoneNumber } = req.body;
+  try {
+    const { phoneNumber } = req.body;
 
-  if (!PHONE_REGEX.test(phoneNumber)) {
-    return res.status(400).json({ message: "Invalid phone number" });
+    if (!PHONE_REGEX.test(phoneNumber)) {
+      return res.status(400).json({ message: "Invalid phone number" });
+    }
+
+    const user = await User.findOne({ phoneNumber });
+    if (!user) return res.status(404).json({ message: "User not found" });
+
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const hash = await bcrypt.hash(code, 10);
+
+    await Otp.create({
+      phoneNumber,
+      codeHash: hash,
+      expiresAt: new Date(Date.now() + 10 * 60 * 1000),
+      used: false,
+    });
+
+    console.log("OTP:", code);
+    res.json({ message: "OTP sent (dev mode)" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Internal server error" });
   }
-
-  const user = await User.findOne({ phoneNumber });
-  if (!user) return res.status(404).json({ message: "User not found" });
-
-  const code = Math.floor(100000 + Math.random() * 900000).toString();
-  const hash = await bcrypt.hash(code, 10);
-
-  await Otp.create({
-    phoneNumber,
-    codeHash: hash,
-    expiresAt: new Date(Date.now() + 10 * 60 * 1000),
-    used: false,
-  });
-
-  console.log("OTP:", code);
-  res.json({ message: "OTP sent (dev mode)" });
 });
 
 app.post("/auth/verify-otp", async (req, res) => {
-  const { phoneNumber, code } = req.body;
+  try {
+    const { phoneNumber, code } = req.body;
 
-  const otp = await Otp.findOne({ phoneNumber }).sort({ createdAt: -1 });
-  if (!otp || otp.used || otp.expiresAt < new Date()) {
-    return res.status(400).json({ message: "Invalid OTP" });
+    const otp = await Otp.findOne({ phoneNumber }).sort({ createdAt: -1 });
+    if (!otp || otp.used || otp.expiresAt < new Date()) {
+      return res.status(400).json({ message: "Invalid OTP" });
+    }
+
+    const ok = await bcrypt.compare(code, otp.codeHash);
+    if (!ok) return res.status(400).json({ message: "Invalid OTP" });
+
+    otp.used = true;
+    await otp.save();
+
+    const user = await User.findOne({ phoneNumber });
+    if (!user) return res.status(404).json({ message: "User not found" });
+
+    // ✅ IMPORTANT: use the same trimmed JWT_SECRET
+    const token = jwt.sign(
+      { userId: user._id.toString(), username: user.username },
+      JWT_SECRET,
+      { expiresIn: "1d" }
+    );
+
+    res.json({
+      token,
+      userId: user._id,
+      username: user.username,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Internal server error" });
   }
-
-  const ok = await bcrypt.compare(code, otp.codeHash);
-  if (!ok) return res.status(400).json({ message: "Invalid OTP" });
-
-  otp.used = true;
-  await otp.save();
-
-  const user = await User.findOne({ phoneNumber });
-
-  const token = jwt.sign(
-    { userId: user._id, username: user.username },
-    JWT_SECRET,
-    { expiresIn: "1d" }
-  );
-
-  res.json({
-    token,
-    userId: user._id,
-    username: user.username,
-  });
 });
 
 // -------------------- CONVERSATIONS --------------------
 app.get("/conversations/:userId", authMiddleware, async (req, res) => {
-  const conversations = await Conversation.find({
-    participants: req.params.userId,
-  });
-
-  const enriched = [];
-  for (const c of conversations) {
-    const otherId = c.participants.find(
-      (p) => p.toString() !== req.params.userId
-    );
-    const other = await User.findById(otherId);
-    enriched.push({
-      _id: c._id,
-      otherUserId: otherId,
-      otherUsername: other?.username || "Unknown",
+  try {
+    const conversations = await Conversation.find({
+      participants: req.params.userId,
     });
-  }
 
-  res.json({ conversations: enriched });
+    const enriched = [];
+    for (const c of conversations) {
+      const otherId = c.participants.find(
+        (p) => p.toString() !== req.params.userId
+      );
+      const other = await User.findById(otherId);
+      enriched.push({
+        _id: c._id,
+        otherUserId: otherId,
+        otherUsername: other?.username || "Unknown",
+      });
+    }
+
+    res.json({ conversations: enriched });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Internal server error" });
+  }
 });
 
 app.post("/conversations/by-phone", authMiddleware, async (req, res) => {
-  const { myUserId, otherPhone } = req.body;
+  try {
+    const { myUserId, otherPhone } = req.body;
 
-  const other = await User.findOne({ phoneNumber: otherPhone });
-  if (!other) return res.status(404).json({ message: "User not found" });
+    const other = await User.findOne({ phoneNumber: otherPhone });
+    if (!other) return res.status(404).json({ message: "User not found" });
 
-  let convo = await Conversation.findOne({
-    participants: { $all: [myUserId, other._id] },
-  });
-
-  if (!convo) {
-    convo = await Conversation.create({
-      participants: [myUserId, other._id],
+    let convo = await Conversation.findOne({
+      participants: { $all: [myUserId, other._id] },
     });
-  }
 
-  res.json({
-    conversationId: convo._id,
-    otherUserId: other._id,
-    otherUsername: other.username,
-  });
+    if (!convo) {
+      convo = await Conversation.create({
+        participants: [myUserId, other._id],
+      });
+    }
+
+    res.json({
+      conversationId: convo._id,
+      otherUserId: other._id,
+      otherUsername: other.username,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Internal server error" });
+  }
 });
 
 // -------------------- MESSAGES --------------------
 app.post("/messages", authMiddleware, async (req, res) => {
-  const { conversationId, ciphertext, iv } = req.body;
-  const senderId = req.userId;
+  try {
+    const { conversationId, ciphertext, iv } = req.body;
 
-  const msg = await Message.create({
-    conversationId,
-    senderId,
-    ciphertext,
-    iv,
-  });
+    // ✅ middleware sets req.user, not req.userId
+    const senderId = req.user?.userId;
 
-  io.to(conversationId).emit("newMessage", msg);
+    if (!senderId) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
 
-  res.status(201).json({ data: msg });
+    const msg = await Message.create({
+      conversationId,
+      senderId,
+      ciphertext,
+      iv,
+    });
+
+    io.to(conversationId).emit("newMessage", msg);
+
+    res.status(201).json({ data: msg });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Internal server error" });
+  }
 });
 
 app.get("/messages", authMiddleware, async (req, res) => {
-  const messages = await Message.find({
-    conversationId: req.query.conversationId,
-  }).sort({ createdAt: 1 });
+  try {
+    const messages = await Message.find({
+      conversationId: req.query.conversationId,
+    }).sort({ createdAt: 1 });
 
-  res.json({ messages });
+    res.json({ messages });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Internal server error" });
+  }
 });
 
 // -------------------- SOCKET EVENTS --------------------
+const onlineUsers = new Map();
+
 io.on("connection", (socket) => {
   socket.on("registerUser", (userId) => {
     if (!onlineUsers.has(userId)) onlineUsers.set(userId, new Set());
