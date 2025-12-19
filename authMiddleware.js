@@ -11,7 +11,6 @@ function getTokenFromHeader(req) {
   const token = parts.slice(1).join(" ");
 
   if (!/^Bearer$/i.test(scheme)) return null;
-
   return token.trim();
 }
 
@@ -39,7 +38,7 @@ module.exports = function authMiddleware(req, res, next) {
   try {
     const decoded = jwt.verify(token, secret);
 
-    // ✅ Consistent fields for your routes
+    // ✅ Make fields consistent everywhere
     req.user = decoded;
     req.userId = decoded.userId;
     req.username = decoded.username;

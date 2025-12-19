@@ -15,11 +15,9 @@ const Message = require("./models/Message");
 const Otp = require("./models/Otp");
 const authMiddleware = require("./authMiddleware");
 
-// ✅ Always trim once and use everywhere
 const JWT_SECRET = (process.env.JWT_SECRET || "").trim();
-
 if (!JWT_SECRET || JWT_SECRET.length < 20) {
-  console.error("❌ JWT_SECRET missing/too short. Fix Render env vars.");
+  console.error("❌ JWT_SECRET missing/too short. Fix env vars.");
   process.exit(1);
 }
 
@@ -38,39 +36,30 @@ const allowedOrigins = [
   "https://oldschool-messanger-frontend.vercel.app",
 ];
 
-// allow function so socket.io + express both behave well
-const corsOptions = {
-  origin: (origin, callback) => {
-    // allow non-browser requests (like Postman) where origin is undefined
-    if (!origin) return callback(null, true);
+app.use(
+  cors({
+    origin: allowedOrigins,
+    credentials: true,
+  })
+);
 
-    if (allowedOrigins.includes(origin)) return callback(null, true);
-
-    return callback(new Error("Not allowed by CORS: " + origin));
-  },
-  credentials: true,
-};
-
-app.use(cors(corsOptions));
 app.use(helmet());
 app.use(express.json());
 
 // -------------------- SOCKET --------------------
 const io = new Server(server, {
   cors: {
-    origin: allowedOrigins, // socket.io accepts array directly
+    origin: allowedOrigins,
     methods: ["GET", "POST"],
     credentials: true,
   },
 });
 
-// store io in app (useful later)
-app.set("io", io);
+// store sockets per user (for presence)
+const onlineUsers = new Map(); // userId -> Set(socketId)
 
 // -------------------- HEALTH --------------------
-app.get("/health", (req, res) => {
-  res.json({ status: "ok" });
-});
+app.get("/health", (req, res) => res.json({ status: "ok" }));
 
 // -------------------- AUTH --------------------
 app.post("/signup", async (req, res) => {
@@ -88,10 +77,7 @@ app.post("/signup", async (req, res) => {
     const existing = await User.findOne({
       $or: [{ username }, { phoneNumber }],
     });
-
-    if (existing) {
-      return res.status(400).json({ message: "User already exists" });
-    }
+    if (existing) return res.status(400).json({ message: "User already exists" });
 
     const hashedPassword = await bcrypt.hash(password, 10);
 
@@ -128,11 +114,7 @@ app.post("/login", async (req, res) => {
       { expiresIn: "1d" }
     );
 
-    res.json({
-      token,
-      userId: user._id,
-      username: user.username,
-    });
+    res.json({ token, userId: user._id, username: user.username });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: "Internal server error" });
@@ -193,11 +175,7 @@ app.post("/auth/verify-otp", async (req, res) => {
       { expiresIn: "1d" }
     );
 
-    res.json({
-      token,
-      userId: user._id,
-      username: user.username,
-    });
+    res.json({ token, userId: user._id, username: user.username });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: "Internal server error" });
@@ -267,19 +245,32 @@ app.post("/messages", authMiddleware, async (req, res) => {
 
     if (!senderId) return res.status(401).json({ message: "Unauthorized" });
 
-    // optional safety check (prevents sending to random convoId)
-    const convo = await Conversation.findById(conversationId);
-    if (!convo) return res.status(404).json({ message: "Conversation not found" });
-
     const msg = await Message.create({
       conversationId,
       senderId,
       ciphertext,
       iv,
+      deliveredAt: null,
+      readAt: null,
     });
 
-    // ✅ IMPORTANT: emit to room = conversationId
-    io.to(conversationId.toString()).emit("newMessage", msg);
+    io.to(String(conversationId)).emit("newMessage", msg);
+
+    // delivered if someone else is in room (sender + receiver)
+    const room = io.sockets.adapter.rooms.get(String(conversationId));
+    const roomSize = room ? room.size : 0;
+
+    if (roomSize >= 2) {
+      const now = new Date();
+      await Message.updateOne({ _id: msg._id }, { $set: { deliveredAt: now } });
+
+      io.to(String(conversationId)).emit("messageStatusUpdate", {
+        messageId: msg._id,
+        deliveredAt: now,
+      });
+
+      msg.deliveredAt = now;
+    }
 
     res.status(201).json({ data: msg });
   } catch (err) {
@@ -302,54 +293,70 @@ app.get("/messages", authMiddleware, async (req, res) => {
 });
 
 // -------------------- SOCKET EVENTS --------------------
-const onlineUsers = new Map();
-
 io.on("connection", (socket) => {
-  console.log("✅ socket connected:", socket.id);
-
   socket.on("registerUser", (userId) => {
-    if (!userId) return;
+    socket.userId = String(userId);
 
-    if (!onlineUsers.has(userId)) onlineUsers.set(userId, new Set());
-    onlineUsers.get(userId).add(socket.id);
+    if (!onlineUsers.has(socket.userId)) onlineUsers.set(socket.userId, new Set());
+    onlineUsers.get(socket.userId).add(socket.id);
 
-    socket.join(userId); // ✅ user room (optional but useful)
-    io.emit("presenceUpdate", { userId, online: true });
+    io.emit("presenceUpdate", {
+      userId: socket.userId,
+      online: true,
+      lastSeen: null,
+    });
   });
 
-  // ✅ KEY FIX: joinConversation MUST be called from frontend when opening a chat
   socket.on("joinConversation", (conversationId) => {
-    if (!conversationId) return;
-    socket.join(conversationId.toString());
-    console.log("✅ joined conversation room:", conversationId);
+    socket.join(String(conversationId));
   });
 
-  // OPTIONAL: if you later want to send via socket instead of REST
-  socket.on("sendMessage", async ({ conversationId, ciphertext, iv, senderId }) => {
+  // mark as READ (updates DB + emits readAt)
+  socket.on("conversationRead", async ({ conversationId, userId }) => {
     try {
-      if (!conversationId || !ciphertext || !iv || !senderId) return;
+      const now = new Date();
 
-      const msg = await Message.create({ conversationId, senderId, ciphertext, iv });
-      io.to(conversationId.toString()).emit("newMessage", msg);
-    } catch (e) {
-      console.error("sendMessage socket error:", e);
+      const unread = await Message.find({
+        conversationId,
+        senderId: { $ne: userId },
+        readAt: null,
+      });
+
+      await Message.updateMany(
+        { conversationId, senderId: { $ne: userId }, readAt: null },
+        { $set: { readAt: now } }
+      );
+
+      unread.forEach((msg) => {
+        io.to(String(conversationId)).emit("messageStatusUpdate", {
+          messageId: msg._id,
+          readAt: now,
+        });
+      });
+    } catch (err) {
+      console.error("conversationRead error:", err);
     }
   });
 
   socket.on("disconnect", () => {
-    for (const [userId, sockets] of onlineUsers) {
-      sockets.delete(socket.id);
-      if (sockets.size === 0) {
-        onlineUsers.delete(userId);
-        io.emit("presenceUpdate", { userId, online: false });
-      }
+    if (!socket.userId) return;
+
+    const sockets = onlineUsers.get(socket.userId);
+    if (!sockets) return;
+
+    sockets.delete(socket.id);
+
+    if (sockets.size === 0) {
+      onlineUsers.delete(socket.userId);
+      io.emit("presenceUpdate", {
+        userId: socket.userId,
+        online: false,
+        lastSeen: new Date(),
+      });
     }
-    console.log("❌ socket disconnected:", socket.id);
   });
 });
 
 // -------------------- START --------------------
 const PORT = process.env.PORT || 4000;
-server.listen(PORT, () => {
-  console.log("Server running on port", PORT);
-});
+server.listen(PORT, () => console.log("Server running on port", PORT));
