@@ -38,24 +38,34 @@ const allowedOrigins = [
   "https://oldschool-messanger-frontend.vercel.app",
 ];
 
-app.use(
-  cors({
-    origin: allowedOrigins,
-    credentials: true,
-  })
-);
+// allow function so socket.io + express both behave well
+const corsOptions = {
+  origin: (origin, callback) => {
+    // allow non-browser requests (like Postman) where origin is undefined
+    if (!origin) return callback(null, true);
 
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+
+    return callback(new Error("Not allowed by CORS: " + origin));
+  },
+  credentials: true,
+};
+
+app.use(cors(corsOptions));
 app.use(helmet());
 app.use(express.json());
 
 // -------------------- SOCKET --------------------
 const io = new Server(server, {
   cors: {
-    origin: allowedOrigins,
+    origin: allowedOrigins, // socket.io accepts array directly
     methods: ["GET", "POST"],
     credentials: true,
   },
 });
+
+// store io in app (useful later)
+app.set("io", io);
 
 // -------------------- HEALTH --------------------
 app.get("/health", (req, res) => {
@@ -177,7 +187,6 @@ app.post("/auth/verify-otp", async (req, res) => {
     const user = await User.findOne({ phoneNumber });
     if (!user) return res.status(404).json({ message: "User not found" });
 
-    // ✅ IMPORTANT: use the same trimmed JWT_SECRET
     const token = jwt.sign(
       { userId: user._id.toString(), username: user.username },
       JWT_SECRET,
@@ -254,13 +263,13 @@ app.post("/conversations/by-phone", authMiddleware, async (req, res) => {
 app.post("/messages", authMiddleware, async (req, res) => {
   try {
     const { conversationId, ciphertext, iv } = req.body;
-
-    // ✅ middleware sets req.user, not req.userId
     const senderId = req.user?.userId;
 
-    if (!senderId) {
-      return res.status(401).json({ message: "Unauthorized" });
-    }
+    if (!senderId) return res.status(401).json({ message: "Unauthorized" });
+
+    // optional safety check (prevents sending to random convoId)
+    const convo = await Conversation.findById(conversationId);
+    if (!convo) return res.status(404).json({ message: "Conversation not found" });
 
     const msg = await Message.create({
       conversationId,
@@ -269,7 +278,8 @@ app.post("/messages", authMiddleware, async (req, res) => {
       iv,
     });
 
-    io.to(conversationId).emit("newMessage", msg);
+    // ✅ IMPORTANT: emit to room = conversationId
+    io.to(conversationId.toString()).emit("newMessage", msg);
 
     res.status(201).json({ data: msg });
   } catch (err) {
@@ -295,13 +305,36 @@ app.get("/messages", authMiddleware, async (req, res) => {
 const onlineUsers = new Map();
 
 io.on("connection", (socket) => {
+  console.log("✅ socket connected:", socket.id);
+
   socket.on("registerUser", (userId) => {
+    if (!userId) return;
+
     if (!onlineUsers.has(userId)) onlineUsers.set(userId, new Set());
     onlineUsers.get(userId).add(socket.id);
+
+    socket.join(userId); // ✅ user room (optional but useful)
     io.emit("presenceUpdate", { userId, online: true });
   });
 
-  socket.on("joinConversation", (id) => socket.join(id));
+  // ✅ KEY FIX: joinConversation MUST be called from frontend when opening a chat
+  socket.on("joinConversation", (conversationId) => {
+    if (!conversationId) return;
+    socket.join(conversationId.toString());
+    console.log("✅ joined conversation room:", conversationId);
+  });
+
+  // OPTIONAL: if you later want to send via socket instead of REST
+  socket.on("sendMessage", async ({ conversationId, ciphertext, iv, senderId }) => {
+    try {
+      if (!conversationId || !ciphertext || !iv || !senderId) return;
+
+      const msg = await Message.create({ conversationId, senderId, ciphertext, iv });
+      io.to(conversationId.toString()).emit("newMessage", msg);
+    } catch (e) {
+      console.error("sendMessage socket error:", e);
+    }
+  });
 
   socket.on("disconnect", () => {
     for (const [userId, sockets] of onlineUsers) {
@@ -311,6 +344,7 @@ io.on("connection", (socket) => {
         io.emit("presenceUpdate", { userId, online: false });
       }
     }
+    console.log("❌ socket disconnected:", socket.id);
   });
 });
 
